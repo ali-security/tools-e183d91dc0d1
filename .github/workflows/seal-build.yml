@@ -1,0 +1,235 @@
+name: seal-build
+
+# Sealed build of golang.org/x/tools v0.0.0-20190114222345-bf090417da8b.
+# Upstream has no GitHub Actions CI (Gerrit + Go build dashboard), so this
+# single workflow (a) produces the module zip exactly as the module proxy does
+# and (b) builds and tests the tree the way the dashboard did in January 2019:
+# GOPATH mode on a contemporary Go (1.11.x), with golang.org/x/net pinned in
+# GOPATH at the commit current at the time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Package pattern(s) passed to go test (default: ./...)"
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  MODULE_PATH: golang.org/x/tools
+  MODULE_VERSION: v0.0.0-20190114222345-bf090417da8b
+  # The public proxy zip has 1020 entries: 1030 tracked files minus 10 files in
+  # 5 go/packages testdata dirs that carry their own go.mod (nested modules,
+  # excluded by zip.CreateFromDir). There is no root go.mod at this commit.
+  EXPECTED_ZIP_ENTRIES: '1020'
+
+jobs:
+  module-zip:
+    name: module-zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go (zip helper toolchain)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: false
+
+      - name: Build create_mod helper (golang.org/x/mod v0.24.0)
+        run: |
+          set -euxo pipefail
+          HELPER="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/create_mod.go"
+          cd "$HELPER"
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" ./create_mod.go
+          test -x "$RUNNER_TEMP/create_mod"
+
+      - name: Stage module tree (exclude .git and .github)
+        run: |
+          set -euxo pipefail
+          STAGE="$RUNNER_TEMP/zipsrc"
+          mkdir -p "$STAGE"
+          tar -c --exclude=.git --exclude=.github -C "$GITHUB_WORKSPACE" . | tar -x -C "$STAGE"
+          test ! -e "$STAGE/.git"
+          test ! -e "$STAGE/.github"
+          test ! -e "$STAGE/go.mod"
+          test -f "$STAGE/LICENSE"
+          test -f "$STAGE/.gitignore"
+          test -f "$STAGE/.gitattributes"
+
+      - name: Create module zip
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          ZIP="$RUNNER_TEMP/out/${MODULE_VERSION}.zip"
+          "$RUNNER_TEMP/create_mod" "$MODULE_PATH" "$MODULE_VERSION" "$RUNNER_TEMP/zipsrc" "$ZIP"
+          COUNT="$(unzip -Z1 "$ZIP" | wc -l | tr -d ' ')"
+          echo "zip entries: $COUNT (expected $EXPECTED_ZIP_ENTRIES)"
+          if [ "$COUNT" -ne "$EXPECTED_ZIP_ENTRIES" ]; then
+            echo "::error::module zip has $COUNT entries, expected $EXPECTED_ZIP_ENTRIES"
+            exit 1
+          fi
+          if unzip -Z1 "$ZIP" | grep -Ev "^${MODULE_PATH}@${MODULE_VERSION}/"; then
+            echo "::error::zip entries outside ${MODULE_PATH}@${MODULE_VERSION}/"
+            exit 1
+          fi
+          sha256sum "$ZIP"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.0.0-20190114222345-bf090417da8b.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go 1.11.13)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    env:
+      # GO111MODULE stays unset (Go 1.11 default "auto"), as on the Go build
+      # dashboard in January 2019: the checkout under GOPATH (no go.mod) builds
+      # in GOPATH mode, while packagestest's Modules exporter still gets module
+      # mode. Forcing "off" breaks imports' Modules subtests, because
+      # shouldUseGoPackages probes `go env GOMOD` with the inherited env.
+      GOPATH: ${{ github.workspace }}/gopath
+      GOFLAGS: ''
+      # imports' Modules subtests `go list` GOROOT cmd/* packages, which makes
+      # Go 1.11 resolve their vendored deps "latest". Go 1.11 has no default
+      # proxy, so that was concurrent direct git fetches, which race on the
+      # shared VCS cache ("shallow file has changed since we read it").
+      GOPROXY: https://proxy.golang.org
+      # Go 1.11 cgo cannot parse the DWARF emitted by current Xcode clang
+      # ("malformed DWARF TagVariable entry"), so macOS runs as a nocgo leg.
+      CGO_ENABLED: ${{ matrix.os == 'macos-14' && '0' || '1' }}
+      TEST_PKGS: ${{ inputs.test-filter || './...' }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: gopath/src/golang.org/x/tools
+    steps:
+      - name: Disable CRLF conversion (Windows)
+        if: runner.os == 'Windows'
+        working-directory: ${{ github.workspace }}
+        run: git config --global core.autocrlf false
+
+      - name: Checkout golang.org/x/tools into GOPATH
+        uses: actions/checkout@v4
+        with:
+          path: gopath/src/golang.org/x/tools
+
+      - name: Checkout golang.org/x/net into GOPATH (915654e7eabc, 2019-01-10)
+        uses: actions/checkout@v4
+        with:
+          repository: golang/net
+          ref: 915654e7eabcea33ae277abbecf52f0d8b7a9fdc
+          path: gopath/src/golang.org/x/net
+
+      - name: Set up Go 1.11.13
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.11.13'
+          # macos-14 is arm64; Go 1.11 has no darwin/arm64 build, run x64 under Rosetta.
+          architecture: x64
+          cache: false
+
+      - name: Point TEMP/TMP at RUNNER_TEMP (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euxo pipefail
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Install msvcrt MinGW-w64 gcc (Windows)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+
+      - name: Put msvcrt gcc first on PATH (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euxo pipefail
+          # Go 1.11 runtime/cgo references __iob_func, which only the msvcrt
+          # CRT provides; the runner's preinstalled gcc targets UCRT.
+          MINGW_BIN="$(cygpath -w '${{ steps.msys2.outputs.msys2-location }}')\\mingw64\\bin"
+          test -x "$(cygpath -u "$MINGW_BIN")/gcc.exe"
+          echo "$MINGW_BIN" >> "$GITHUB_PATH"
+
+      - name: Verify gcc links against msvcrt (Windows)
+        if: runner.os == 'Windows'
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euxo pipefail
+          command -v gcc
+          gcc --version
+          case "$(command -v gcc)" in
+            */mingw64/bin/gcc*) ;;
+            *) echo "::error::gcc is not the msys2 MINGW64 toolchain"; exit 1 ;;
+          esac
+          printf '__declspec(dllimport) void *__iob_func(void);\nint main(void) { return __iob_func() == 0; }\n' > iobcheck.c
+          gcc iobcheck.c -o iobcheck.exe
+
+      - name: Go environment
+        run: |
+          set -euxo pipefail
+          go version
+          go env
+          go version | grep -F 'go1.11.13'
+          test "$(go env GOARCH)" = amd64
+          test "$(go env CGO_ENABLED)" = "$CGO_ENABLED"
+          # Fail closed if the checkout is not resolved through GOPATH.
+          go list -f '{{.Dir}}' golang.org/x/tools/go/packages golang.org/x/net/html
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            # cmd/splitdwarf is "+build !windows": on Windows only doc.go
+            # remains, so the package has no main function and cannot link.
+            go build $(go list ./... | grep -v '/cmd/splitdwarf$')
+          else
+            go build ./...
+          fi
+
+      - name: Test
+        run: |
+          set -euxo pipefail
+          # -p 1: cmd/godoc TestWebIndex waits only 2m for the search index,
+          # which it misses under parallel package load.
+          go test -p 1 -v $TEST_PKGS 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+      - name: Test summary
+        if: always()
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/go-test.log"
+          test -f "$LOG"
+          awk '
+            /^[ \t]*--- PASS/ { pass++ }
+            /^[ \t]*--- FAIL/ { fail++ }
+            /^[ \t]*--- SKIP/ { skip++ }
+            /^ok[ \t]/        { okpkg++ }
+            /^FAIL[ \t]/      { failpkg++ }
+            END {
+              printf "TEST SUMMARY: %d passed, %d failed, %d skipped (packages: %d ok, %d FAIL)\n", pass, fail, skip, okpkg, failpkg
+            }
+          ' "$LOG"

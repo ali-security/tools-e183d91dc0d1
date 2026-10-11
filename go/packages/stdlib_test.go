@@ -6,6 +6,7 @@ package packages_test
 
 import (
 	"bytes"
+	"go/build"
 	"io/ioutil"
 	"path/filepath"
 	"runtime"
@@ -77,6 +78,16 @@ func TestCgoOption(t *testing.T) {
 	// if !build.Default.CgoEnabled {
 	// 	return
 	// }
+
+	// Sealed build: the Windows net package has no cgoLookupHost (the go/loader
+	// twin of this test skips windows), and nocgo legs (CGO_ENABLED=0, e.g.
+	// macOS with old Go) have no runtime/cgo for the cgo-generated files.
+	if runtime.GOOS == "windows" {
+		t.Skipf("no net.cgoLookupHost on %s", runtime.GOOS)
+	}
+	if !build.Default.CgoEnabled {
+		t.Skip("cgo disabled (nocgo build)")
+	}
 
 	// Test that we can load cgo-using packages with
 	// DisableCgo=true/false, which, among other things, causes go
