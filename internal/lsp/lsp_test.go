@@ -8,9 +8,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
 	"go/token"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -27,6 +32,47 @@ var goVersion111 = true
 
 func TestLSP(t *testing.T) {
 	packagestest.TestAll(t, testLSP)
+}
+
+// TestNoNetworkListener is a regression test for CVE-2026-42503. The golsp
+// -port debugging flag made the server listen on ":<port>", which binds every
+// network interface and exposes the LSP server to other hosts. The server is
+// only reachable through the stream it is given (stdin/stdout), so neither this
+// package nor its command line front end (./cmd) may open a network listener
+// or offer a -port flag.
+func TestNoNetworkListener(t *testing.T) {
+	for _, dir := range []string{".", "cmd"} {
+		fset := token.NewFileSet()
+		pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
+			return !strings.HasSuffix(fi.Name(), "_test.go")
+		}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pkgs) == 0 {
+			t.Fatalf("no Go packages found in %s", dir)
+		}
+		for _, pkg := range pkgs {
+			for _, file := range pkg.Files {
+				ast.Inspect(file, func(n ast.Node) bool {
+					switch n := n.(type) {
+					case *ast.SelectorExpr:
+						if x, ok := n.X.(*ast.Ident); ok && x.Name == "net" && strings.HasPrefix(n.Sel.Name, "Listen") {
+							t.Errorf("%v: net.%s: the LSP server must not listen on a network socket", fset.Position(n.Pos()), n.Sel.Name)
+						}
+					case *ast.Field:
+						if n.Tag == nil {
+							break
+						}
+						if tag, err := strconv.Unquote(n.Tag.Value); err == nil && reflect.StructTag(tag).Get("flag") == "port" {
+							t.Errorf("%v: -port flag: the LSP server must not listen on a network socket", fset.Position(n.Pos()))
+						}
+					}
+					return true
+				})
+			}
+		}
+	}
 }
 
 func testLSP(t *testing.T, exporter packagestest.Exporter) {

@@ -26,7 +26,6 @@ import (
 type Server struct {
 	Logfile string `flag:"logfile" help:"filename to log to. if value is \"auto\", then logging to a default output file is enabled"`
 	Mode    string `flag:"mode" help:"no effect"`
-	Port    int    `flag:"port" help:"port on which to run golsp for debugging purposes"`
 }
 
 func (s *Server) Name() string  { return "server" }
@@ -104,10 +103,6 @@ func (s *Server) Run(ctx context.Context, args ...string) error {
 		}
 		fmt.Fprintf(outx, ".\r\nParams: %s%s", params, eol)
 		fmt.Fprintf(out, "%s", outx.String())
-	}
-	// For debugging purposes only.
-	if s.Port != 0 {
-		return lsp.RunServerOnPort(ctx, s.Port, logger)
 	}
 	stream := jsonrpc2.NewHeaderStream(os.Stdin, os.Stdout)
 	return lsp.RunServer(ctx, stream, logger)

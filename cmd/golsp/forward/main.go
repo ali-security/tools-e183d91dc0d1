@@ -15,11 +15,12 @@ import (
 )
 
 func main() {
-	tool.Main(context.Background(), &app{&cmd.Server{}}, os.Args[1:])
+	tool.Main(context.Background(), &app{Server: &cmd.Server{}}, os.Args[1:])
 }
 
 type app struct {
 	*cmd.Server
+	Port int `flag:"port" help:"port on which golsp is listening"`
 }
 
 func (*app) Name() string               { return "forward" }
@@ -28,11 +29,11 @@ func (*app) ShortHelp() string          { return "An intermediary between an edi
 func (*app) DetailedHelp(*flag.FlagSet) {}
 
 func (a *app) Run(ctx context.Context, args ...string) error {
-	if a.Server.Port == 0 {
+	if a.Port == 0 {
 		a.ShortHelp()
 		os.Exit(0)
 	}
-	conn, err := net.Dial("tcp", fmt.Sprintf(":%v", a.Server.Port))
+	conn, err := net.Dial("tcp", fmt.Sprintf(":%v", a.Port))
 	if err != nil {
 		log.Print(err)
 		os.Exit(0)
